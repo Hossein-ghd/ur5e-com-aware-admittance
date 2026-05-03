@@ -3,25 +3,24 @@ import signal
 import math
 import time
 import numpy as np
-from scipy.signal import butter, filtfilt
 import logging
 import socket
 from pathlib import Path
 import csv
 
-RUN_NAME = "objA_trial01_corrected"
+RUN_NAME = "objA_trial01_corr" #for nominal run use "objA_trial01_nom"
 OBJECT_ID = "objA"
 OBJECT_ORIENTATION = "ori0"
 
 # Transport compensation mode:
 #   "NONE" -> no transport compensation
-#   "Z"   -> old vertical-only compensation
-#   "3D"  -> new three-axis translational compensation
-TRANSPORT_COMP_MODE = "3D"
+#   "Z"    -> compensate payload effect only in z
+#   "3D"   -> compensate payload effect in all three translational axes
+TRANSPORT_COMP_MODE = "Z"
 APPLY_TRANSPORT_COMP = (TRANSPORT_COMP_MODE != "NONE")
 
-# placement correction (not transport compensation)
-APPLY_XY_CORR = True
+# Placement correction only in x and y
+APPLY_XY_CORR = True #for nominal run use False
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -56,31 +55,27 @@ watchdog = con.send_input_setup(watchdog_names, watchdog_types)
 watchdog.input_int_register_0 = 0
 con.send(watchdog)
 
-saved_data1 = np.array([0, 0, 0])      # force (base)
-saved_data2 = np.array([0, 0, 0])      # tcp position
-saved_data3 = np.array([0, 0, 0])      # position error
-saved_data4 = np.array([0, 0, 0])      # accel (base filtered)
-saved_data5 = np.array([0])            # mass estimate used
-saved_data6 = np.array([0, 0, 0])      # compensated force snapshot
-saved_data7 = np.array([0, 0, 0])      # compensated torque snapshot
-saved_data8 = np.array([0, 0, 0])      # estimated CoM (r) in base
-saved_data9 = np.array([0, 0, 0])      # estimated CoM (r) in tool
+saved_data1 = np.empty((0, 3))  # force (base)
+saved_data2 = np.empty((0, 3))  # tcp position
+saved_data3 = np.empty((0, 3))  # position error
+saved_data4 = np.empty((0, 3))  # accel (base filtered)
+saved_data5 = np.empty((0, 1))  # mass estimate used
+saved_data6 = np.empty((0, 3))  # compensated force snapshot
+saved_data7 = np.empty((0, 3))  # compensated torque snapshot
+saved_data8 = np.empty((0, 3))  # estimated CoM (r) in base
+saved_data9 = np.empty((0, 3))  # estimated CoM (r) in tool
 
 payload_mass_locked = 0.0
 payload_mass_is_valid = False
 mass_est_samples = []
 
-MASS_EST_MIN_SAMPLES = 15
+MASS_EST_MIN_SAMPLES = 20
 MASS_EST_MAX_SAMPLES = 100
 MASS_EST_DEN_THRESH = 2.0
 MASS_EST_EXTRA_DELAY = 1.5
 
-MEASURE_POS_TOL = 0.003
-MEASURE_HOLD_TIME = 0.40
-COM_EST_MIN_SAMPLES = 15
-
-measure_hold_started = False
-measure_hold_t0 = 0.0
+MEASURE_POS_TOL = 0.0075
+COM_EST_MIN_SAMPLES = 20
 
 def create_socket():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -101,7 +96,7 @@ def shutdown_handler(sig, frame):
     con.disconnect()
     try:
         sock.close()
-    except:
+    except Exception:
         pass
     keep_running = False
 
@@ -148,80 +143,24 @@ def list_to_setp(setp, velocity, grip):
         setattr(setp, f"input_double_register_{i}", velocity[i])
     setp.input_double_register_6 = grip
 
-def butter_lowpass_filter(data, cutoff, fs, order=4):
-    nyquist = 0.5 * fs
-    normal_cutoff = cutoff / nyquist
-    b, a = butter(order, normal_cutoff, btype="low", analog=False)
-    if len(data) > 10:
-        return filtfilt(b, a, data)
-    return data
-
 def skew(v):
     return np.array([
-        [0, -v[2], v[1]],
-        [v[2], 0, -v[0]],
-        [-v[1], v[0], 0]
+        [0.0,   -v[2],  v[1]],
+        [v[2],   0.0,  -v[0]],
+        [-v[1],  v[0],  0.0],
     ])
 
 def rodrigues_rotate(v, axis, theta):
     return (
         v * np.cos(theta)
         + np.cross(axis, v) * np.sin(theta)
-        + axis * np.dot(axis, v) * (1 - np.cos(theta))
+        + axis * np.dot(axis, v) * (1.0 - np.cos(theta))
     )
-
-def rotvec_to_R(rv):
-    theta = np.linalg.norm(rv)
-    if theta < 1e-9:
-        return np.eye(3)
-    u = rv / theta
-    K = skew(u)
-    return np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
-
-def R_to_rotvec(R):
-    tr = np.trace(R)
-    cos_theta = np.clip((tr - 1.0) / 2.0, -1.0, 1.0)
-    theta = np.arccos(cos_theta)
-    if theta < 1e-9:
-        return np.zeros(3)
-    if abs(theta - np.pi) < 1e-3:
-        A = (R + np.eye(3)) * 0.5
-        axis = np.array([
-            np.sqrt(max(A[0, 0], 0.0)),
-            np.sqrt(max(A[1, 1], 0.0)),
-            np.sqrt(max(A[2, 2], 0.0))
-        ])
-        axis[0] = math.copysign(axis[0], R[2, 1] - R[1, 2])
-        axis[1] = math.copysign(axis[1], R[0, 2] - R[2, 0])
-        axis[2] = math.copysign(axis[2], R[1, 0] - R[0, 1])
-        n = np.linalg.norm(axis)
-        axis = axis / (n + 1e-12)
-    else:
-        axis = (1.0 / (2.0 * np.sin(theta))) * np.array([
-            R[2, 1] - R[1, 2],
-            R[0, 2] - R[2, 0],
-            R[1, 0] - R[0, 1]
-        ])
-    return axis * theta
 
 def add_vec3(row, name, v):
     row[f"{name}_x"] = float(v[0])
     row[f"{name}_y"] = float(v[1])
     row[f"{name}_z"] = float(v[2])
-
-def estimate_offset_ls(force_samples, torque_samples):
-    if len(force_samples) == 0:
-        return np.zeros(3), False
-    A = np.vstack([-skew(fk) for fk in force_samples])
-    b = np.hstack(torque_samples)
-    if A.shape[0] < 9:
-        return np.zeros(3), False
-    if np.linalg.matrix_rank(A) < 3:
-        return np.zeros(3), False
-    r_hat, *_ = np.linalg.lstsq(A, b, rcond=None)
-    if not np.all(np.isfinite(r_hat)):
-        return np.zeros(3), False
-    return r_hat, True
 
 if not con.send_start():
     sys.exit()
@@ -232,7 +171,7 @@ signal.signal(signal.SIGINT, shutdown_handler)
 tare = None
 acc_tare = 0.0
 tau_tare = None
-gripper_wt = np.array([0, 0, -11.45])
+gripper_wt = np.array([0.0, 0.0, -11.45])
 grasp = 0
 grasp_delay = time.time()
 
@@ -244,14 +183,13 @@ tool_accelerometer_tf_filtered = np.zeros((3, M_SAMPLES))
 counter = 0
 
 F_MIN_NORM = 5.0
-com_est = np.zeros(3)
-com_est_tool = np.zeros(3)
 
 COM_AVG_WINDOW = 50
-com_force_samples = []
-com_torque_samples = []
+com_tool_samples = []
 com_offset_is_valid = False
 
+com_est = np.zeros(3)
+com_est_tool = np.zeros(3)
 com_est_tool_avg = np.zeros(3)
 com_est_avg = np.zeros(3)
 
@@ -259,7 +197,7 @@ measure_wp_idx = 3
 pre_place_wp_idx = 4
 place_wp_idx = 5
 release_wp_idx = 6
-STACK_HEIGHT = 0.041
+STACK_HEIGHT = 0.021
 stack_count = 0
 
 waypoints = np.array([
@@ -268,7 +206,7 @@ waypoints = np.array([
     [0.000, 0.680, -0.013],  # wp3 close
     [0.133, 0.492, 0.2446],  # wp4 measurement
     [-0.30, 0.300, 0.030],   # wp5 pre-place
-    [-0.30, 0.300, 0.022],   # wp6 place
+    [-0.30, 0.300, 0.020],   # wp6 place
     [0.000, 0.400, 0.300],   # wp7 retreat
 ])
 
@@ -280,9 +218,16 @@ velocity = np.zeros(6)
 desired_accel_m1 = np.zeros(3)
 desired_velocity_3d = np.zeros(3)
 
+# Disturbance-free reference model kept for checking only.
+# The plotting trajectory requested for Fig. 3 is the integrated commanded trajectory below.
 ideal_position_3d = None
 ideal_velocity_3d = np.zeros(3)
 ideal_accel_3d = np.zeros(3)
+
+# Position obtained by integrating the final commanded velocity sent to RTDE.
+# This is logged both as cmd_traj_* and ideal_traj_* for compatibility with the current plot file.
+cmd_position_3d = None
+cmd_velocity_3d = np.zeros(3)
 
 prev_time = time.time()
 
@@ -349,27 +294,31 @@ while keep_running:
         tare = compensated_force_filtered + tare
         tau_tare = compensated_torque_filtered + tau_tare
 
-    tool_accelerometer_tf = tool_accelerometer_tf + np.array([0, 0, 9.81])
+    tool_accelerometer_tf = tool_accelerometer_tf + np.array([0.0, 0.0, 9.81])
     tool_accelerometer_tf_filtered[:, np.mod(counter, M_SAMPLES)] = tool_accelerometer_tf
     tool_accelerometer_tf_filtered_new = np.mean(tool_accelerometer_tf_filtered, axis=1) - acc_tare
     if counter == M_SAMPLES:
         acc_tare = tool_accelerometer_tf_filtered_new
 
-    m = 10
-    k = 2000
-    b = 4 * 2 * np.sqrt(m * k)
+    # Virtual admittance parameters
+    m = 4.0
+    k = 300.0
+    b = 4.0 * 2.0 * np.sqrt(m * k)
 
     actual_position = np.array(tcp_pose[:3])
     waypoint_nom = waypoint.copy()
     waypoint_cmd = waypoint.copy()
+
     if ideal_position_3d is None:
         ideal_position_3d = actual_position.copy()
 
+    # Apply CoM-based placement correction only in x and y
     if APPLY_XY_CORR and (grasp == 100) and (now_time > grasp_delay) and \
        (wp_num_ctrl in [pre_place_wp_idx, place_wp_idx, release_wp_idx]):
         waypoint_cmd[0] = waypoint[0] - com_est_avg[0]
         waypoint_cmd[1] = waypoint[1] - com_est_avg[1]
 
+    # z command is kept as the nominal placement height
     waypoint_cmd[2] = waypoint[2]
     if (grasp == 100) and (now_time > grasp_delay) and \
        (wp_num_ctrl in [pre_place_wp_idx, place_wp_idx, release_wp_idx]):
@@ -379,17 +328,7 @@ while keep_running:
     reached_pos = (np.linalg.norm(waypoint_cmd[:3] - actual_position) < MEASURE_POS_TOL)
 
     gripping_now = (grasp == 100) and (now_time > grasp_delay)
-
     at_measure_wp = gripping_now and (wp_num_ctrl == measure_wp_idx) and reached_pos
-    if at_measure_wp:
-        if not measure_hold_started:
-            measure_hold_started = True
-            measure_hold_t0 = now_time
-    else:
-        measure_hold_started = False
-        measure_hold_t0 = 0.0
-
-    measure_hold_elapsed = (now_time - measure_hold_t0) if measure_hold_started else 0.0
 
     mass_est_window_active = (
         gripping_now
@@ -398,6 +337,7 @@ while keep_running:
     )
 
     z_comp_blocked = gripping_now and (wp_num_ctrl in [place_wp_idx, release_wp_idx])
+
     external_force_3d = compensated_force_filtered[:3].copy()
     payload_force_hat_3d = np.zeros(3)
     residual_force_3d = external_force_3d.copy()
@@ -412,6 +352,7 @@ while keep_running:
     if abs(den_z) > MASS_EST_DEN_THRESH:
         mass_estimation_raw = compensated_force_filtered[2] / den_z
 
+    # Stage 1: estimate payload mass
     if mass_est_window_active and (not payload_mass_is_valid):
         if abs(den_z) > MASS_EST_DEN_THRESH and np.isfinite(mass_estimation_raw):
             if mass_estimation_raw > 0.0:
@@ -429,11 +370,11 @@ while keep_running:
     else:
         mass_estimation_used = 0.0
 
+    # Stage 2: use F_exc idea to compensate payload effect in z
     if gripping_now and APPLY_TRANSPORT_COMP and payload_mass_is_valid:
         if TRANSPORT_COMP_MODE == "Z":
             if not z_comp_blocked:
                 payload_force_hat_3d[2] = mass_estimation_used * acc_minus_g[2]
-
         elif TRANSPORT_COMP_MODE == "3D":
             payload_force_hat_3d = mass_estimation_used * acc_minus_g
             if z_comp_blocked:
@@ -456,65 +397,58 @@ while keep_running:
         ideal_velocity_3d[:] = 0.0
         ideal_accel_3d[:] = 0.0
 
+    # Stage 3: estimate CoM from FT and use moving average
     force_comp_tool = rodrigues_rotate(compensated_force_filtered, rotation_axis, -theta)
     torque_comp_tool = rodrigues_rotate(compensated_torque_filtered, rotation_axis, -theta)
 
     com_est_window_active = (
         gripping_now
         and (wp_num_ctrl == measure_wp_idx)
+        and payload_mass_is_valid
         and (now_time > grasp_delay + MASS_EST_EXTRA_DELAY)
     )
 
-    if com_est_window_active and (np.linalg.norm(force_comp_tool) > F_MIN_NORM):
-        com_force_samples.append(force_comp_tool.copy())
-        com_torque_samples.append(torque_comp_tool.copy())
-        if len(com_force_samples) > COM_AVG_WINDOW:
-            com_force_samples.pop(0)
-            com_torque_samples.pop(0)
+    if com_est_window_active and (abs(force_comp_tool[2]) > F_MIN_NORM):
+        com_est_tool = np.array([
+            -torque_comp_tool[1] / force_comp_tool[2],
+             torque_comp_tool[0] / force_comp_tool[2],
+             0.0
+        ])
+        com_est = rodrigues_rotate(com_est_tool, rotation_axis, theta)
 
-        r_hat_tool, com_ok = estimate_offset_ls(com_force_samples, com_torque_samples)
-        if com_ok:
-            com_est_tool = r_hat_tool
-            com_est = rodrigues_rotate(com_est_tool, rotation_axis, theta)
-            com_est_tool_avg = com_est_tool.copy()
-            com_est_avg = com_est.copy()
+        com_tool_samples.append(com_est_tool.copy())
+        if len(com_tool_samples) > COM_AVG_WINDOW:
+            com_tool_samples.pop(0)
+
+        if len(com_tool_samples) >= COM_EST_MIN_SAMPLES:
+            com_est_tool_avg = np.mean(np.vstack(com_tool_samples), axis=0)
+            com_est_avg = rodrigues_rotate(com_est_tool_avg, rotation_axis, theta)
             com_offset_is_valid = True
+    else:
+        com_est_tool = np.zeros(3)
+        com_est = np.zeros(3)
 
     measurement_done = (
         (wp_num_ctrl == measure_wp_idx)
         and reached_pos
         and payload_mass_is_valid
         and com_offset_is_valid
-        and (len(com_force_samples) >= COM_EST_MIN_SAMPLES)
     )
 
-    print(f"Time: {now_time}")
-    print(f"----------------------------------------------Mass est window active: {mass_est_window_active}")
-    print(f"----------------------------------------------Mass raw: {mass_estimation_raw:.2f} kg")
-    print(f"----------------------------------------------Transport comp mode: {TRANSPORT_COMP_MODE}")
-    print(f"----------------------------------------------Mass used: {mass_estimation_used:.2f} kg")
-    print(f"----------------------------------------------Mass locked: {payload_mass_locked:.2f} kg")
-    print(f"----------------------------------------------Mass valid: {payload_mass_is_valid}")
-    print(f"----------------------------------------------At measure wp: {at_measure_wp}")
-    print(f"----------------------------------------------Measure hold elapsed: {measure_hold_elapsed:.3f} s")
-    print(f"----------------------------------------------Measure done: {measurement_done}")
-    print(f"----------------------------------------------Mass sample count: {len(mass_est_samples)}")
-    print(f"----------------------------------------------CoM sample count: {len(com_force_samples)}")
-    print("waypoint:", waypoint[:6])
-    print("waypoint_cmd:", waypoint_cmd[:3])
-    print("wp_num:", wp_num_ctrl)
-    print("tcp: pos=", tcp_pose[:6])
-    print("error:", error)
-    print("force (comp):", compensated_force_filtered)
-    print("torque (comp):", compensated_torque_filtered)
-    print("acc_filtered_new:", tool_accelerometer_tf_filtered_new)
-    print("payload_force_hat_3d:", payload_force_hat_3d)
-    print("residual_force_3d:", residual_force_3d)
-    print("desired_accel:", desired_accel)
-    print("velocity command (3D):", desired_velocity_3d)
-    print("CoM estimate (base, m):", com_est)
-    print("CoM estimate (tool, m):", com_est_tool)
-    print("Estimated CoM offset from TCP (tool, mm):", 1000.0 * com_est_tool_avg)
+    print(f"Mode={TRANSPORT_COMP_MODE}, comp_on={APPLY_TRANSPORT_COMP}, xy_corr={APPLY_XY_CORR}")
+    print(f"wp={wp_num_ctrl}, gripping={gripping_now}, at_measure_wp={at_measure_wp}, measure_done={measurement_done}")
+    print(f"Mass raw/used/locked/valid [kg]: {mass_estimation_raw:.3f}, {mass_estimation_used:.3f}, {payload_mass_locked:.3f}, {int(payload_mass_is_valid)}")
+    print(f"Mass samples: {len(mass_est_samples)} | CoM samples: {len(com_tool_samples)}")
+    print(f"payload_force_hat_3d [N]: {payload_force_hat_3d}")
+    print(f"residual_force_3d [N]: {residual_force_3d}")
+    print(f"tcp xyz [mm]: {1000.0 * actual_position}")
+    print(f"waypoint_cmd xyz [mm]: {1000.0 * waypoint_cmd[:3]}")
+    print(f"position error xyz [mm]: {1000.0 * error}")
+    print(f"CoM inst tool [mm]: {1000.0 * com_est_tool}")
+    print(f"CoM avg tool  [mm]: {1000.0 * com_est_tool_avg}")
+    print(f"CoM avg base  [mm]: {1000.0 * com_est_avg}")
+    print(f"Applied XY correction [mm]: {np.array([-1000.0 * com_est_avg[0], -1000.0 * com_est_avg[1]])}")
+    print("-" * 80)
 
     vmax = 0.5
     speed_norm = np.linalg.norm(desired_velocity_3d)
@@ -543,20 +477,16 @@ while keep_running:
             close_gripper(sock, con)
             grasp_delay = now_time + GRASP_TIME
 
-            com_force_samples = []
-            com_torque_samples = []
+            payload_mass_locked = 0.0
+            payload_mass_is_valid = False
+            mass_est_samples = []
+
+            com_tool_samples = []
             com_offset_is_valid = False
             com_est_tool_avg = np.zeros(3)
             com_est_avg = np.zeros(3)
             com_est_tool = np.zeros(3)
             com_est = np.zeros(3)
-
-            payload_mass_locked = 0.0
-            payload_mass_is_valid = False
-            mass_est_samples = []
-
-            measure_hold_started = False
-            measure_hold_t0 = 0.0
 
         elif wp_num == 6:
             grasp = 0
@@ -569,16 +499,12 @@ while keep_running:
             payload_mass_is_valid = False
             mass_est_samples = []
 
-            com_force_samples = []
-            com_torque_samples = []
+            com_tool_samples = []
             com_offset_is_valid = False
             com_est_tool_avg = np.zeros(3)
             com_est_avg = np.zeros(3)
             com_est_tool = np.zeros(3)
             com_est = np.zeros(3)
-
-            measure_hold_started = False
-            measure_hold_t0 = 0.0
 
     if now_time <= grasp_delay:
         desired_velocity_3d = np.zeros(3)
@@ -586,6 +512,18 @@ while keep_running:
 
     velocity[:3] = desired_velocity_3d
     velocity[3:6] = 0.0
+
+    # Integrate the final commanded velocity sent to RTDE.
+    # This gives the commanded TCP trajectory used for plotting.
+    if cmd_position_3d is None:
+        cmd_position_3d = actual_position.copy()
+
+    if gripping_now and (now_time > grasp_delay):
+        cmd_position_3d += velocity[:3] * dt
+        cmd_velocity_3d = velocity[:3].copy()
+    else:
+        cmd_position_3d = actual_position.copy()
+        cmd_velocity_3d[:] = 0.0
 
     accelerometer_6 = np.zeros(6)
     accelerometer_6[:3] = desired_accel_m1
@@ -612,10 +550,10 @@ while keep_running:
         "stack_count": int(stack_count),
         "measure_stage": int(at_measure_wp),
         "measure_done": int(measurement_done),
-        "measure_hold_elapsed": float(measure_hold_elapsed),
         "mass_est_window_active": int(mass_est_window_active),
+        "com_est_window_active": int(com_est_window_active),
         "mass_sample_count": int(len(mass_est_samples)),
-        "com_sample_count": int(len(com_force_samples)),
+        "com_sample_count": int(len(com_tool_samples)),
         "pre_place_stage": int(wp_num_ctrl == pre_place_wp_idx),
         "place_stage": int(wp_num_ctrl == place_wp_idx),
         "release_stage": int(wp_num_ctrl == release_wp_idx),
@@ -632,6 +570,22 @@ while keep_running:
     add_vec3(row, "error", error)
     add_vec3(row, "desired_vel", desired_velocity_3d)
     add_vec3(row, "desired_acc", desired_accel)
+
+    # Keep ideal_traj_* for compatibility with the existing plot file.
+    # Here ideal_traj_* means the integrated commanded trajectory.
+    add_vec3(row, "ideal_traj", cmd_position_3d)
+    add_vec3(row, "ideal_vel", cmd_velocity_3d)
+    add_vec3(row, "ideal_acc", desired_accel)
+
+    # Also save explicit names to avoid ambiguity in future plots.
+    add_vec3(row, "cmd_traj", cmd_position_3d)
+    add_vec3(row, "cmd_vel", cmd_velocity_3d)
+
+    # Save the disturbance-free admittance reference separately for checking.
+    add_vec3(row, "ref_traj", ideal_position_3d)
+    add_vec3(row, "ref_vel", ideal_velocity_3d)
+    add_vec3(row, "ref_acc", ideal_accel_3d)
+
     add_vec3(row, "force_comp_base", compensated_force_filtered)
     add_vec3(row, "payload_force_hat_base", payload_force_hat_3d)
     add_vec3(row, "force_residual_base", residual_force_3d)
@@ -644,14 +598,13 @@ while keep_running:
 
     log_rows.append(row)
     counter += 1
-    print(counter)
 
-    saved_data1 = np.vstack([saved_data1, [force_data_tf]])
-    saved_data2 = np.vstack([saved_data2, [tcp_pose[:3]]])
-    saved_data3 = np.vstack([saved_data3, [error]])
-    saved_data4 = np.vstack([saved_data4, [tool_accelerometer_tf_filtered_new]])
-    saved_data5 = np.vstack([saved_data5, [mass_estimation_used]])
-    saved_data6 = np.vstack([saved_data6, [compensated_force_filtered]])
-    saved_data7 = np.vstack([saved_data7, [compensated_torque_filtered]])
-    saved_data8 = np.vstack([saved_data8, [com_est]])
-    saved_data9 = np.vstack([saved_data9, [com_est_tool]])
+    saved_data1 = np.vstack([saved_data1, force_data_tf.reshape(1, 3)])
+    saved_data2 = np.vstack([saved_data2, tcp_pose[:3].reshape(1, 3)])
+    saved_data3 = np.vstack([saved_data3, error.reshape(1, 3)])
+    saved_data4 = np.vstack([saved_data4, tool_accelerometer_tf_filtered_new.reshape(1, 3)])
+    saved_data5 = np.vstack([saved_data5, np.array([[mass_estimation_used]])])
+    saved_data6 = np.vstack([saved_data6, compensated_force_filtered.reshape(1, 3)])
+    saved_data7 = np.vstack([saved_data7, compensated_torque_filtered.reshape(1, 3)])
+    saved_data8 = np.vstack([saved_data8, com_est.reshape(1, 3)])
+    saved_data9 = np.vstack([saved_data9, com_est_tool.reshape(1, 3)])
