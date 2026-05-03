@@ -218,14 +218,10 @@ velocity = np.zeros(6)
 desired_accel_m1 = np.zeros(3)
 desired_velocity_3d = np.zeros(3)
 
-# Disturbance-free reference model kept for checking only.
-# The plotting trajectory requested for Fig. 3 is the integrated commanded trajectory below.
 ideal_position_3d = None
 ideal_velocity_3d = np.zeros(3)
 ideal_accel_3d = np.zeros(3)
 
-# Position obtained by integrating the final commanded velocity sent to RTDE.
-# This is logged both as cmd_traj_* and ideal_traj_* for compatibility with the current plot file.
 cmd_position_3d = None
 cmd_velocity_3d = np.zeros(3)
 
@@ -370,7 +366,6 @@ while keep_running:
     else:
         mass_estimation_used = 0.0
 
-    # Stage 2: use F_exc idea to compensate payload effect in z
     if gripping_now and APPLY_TRANSPORT_COMP and payload_mass_is_valid:
         if TRANSPORT_COMP_MODE == "Z":
             if not z_comp_blocked:
@@ -397,7 +392,6 @@ while keep_running:
         ideal_velocity_3d[:] = 0.0
         ideal_accel_3d[:] = 0.0
 
-    # Stage 3: estimate CoM from FT and use moving average
     force_comp_tool = rodrigues_rotate(compensated_force_filtered, rotation_axis, -theta)
     torque_comp_tool = rodrigues_rotate(compensated_torque_filtered, rotation_axis, -theta)
 
@@ -513,8 +507,7 @@ while keep_running:
     velocity[:3] = desired_velocity_3d
     velocity[3:6] = 0.0
 
-    # Integrate the final commanded velocity sent to RTDE.
-    # This gives the commanded TCP trajectory used for plotting.
+
     if cmd_position_3d is None:
         cmd_position_3d = actual_position.copy()
 
@@ -571,17 +564,16 @@ while keep_running:
     add_vec3(row, "desired_vel", desired_velocity_3d)
     add_vec3(row, "desired_acc", desired_accel)
 
-    # Keep ideal_traj_* for compatibility with the existing plot file.
-    # Here ideal_traj_* means the integrated commanded trajectory.
+
     add_vec3(row, "ideal_traj", cmd_position_3d)
     add_vec3(row, "ideal_vel", cmd_velocity_3d)
     add_vec3(row, "ideal_acc", desired_accel)
 
-    # Also save explicit names to avoid ambiguity in future plots.
+
     add_vec3(row, "cmd_traj", cmd_position_3d)
     add_vec3(row, "cmd_vel", cmd_velocity_3d)
 
-    # Save the disturbance-free admittance reference separately for checking.
+
     add_vec3(row, "ref_traj", ideal_position_3d)
     add_vec3(row, "ref_vel", ideal_velocity_3d)
     add_vec3(row, "ref_acc", ideal_accel_3d)
