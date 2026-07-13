@@ -16,7 +16,7 @@ OBJECT_ORIENTATION = "ori0"
 #   "NONE" -> no transport compensation
 #   "Z"    -> compensate payload effect only in z
 #   "3D"   -> compensate payload effect in all three translational axes
-TRANSPORT_COMP_MODE = "Z"
+TRANSPORT_COMP_MODE = "3D"
 APPLY_TRANSPORT_COMP = (TRANSPORT_COMP_MODE != "NONE")
 
 # Placement correction only in x and y
@@ -69,12 +69,12 @@ payload_mass_locked = 0.0
 payload_mass_is_valid = False
 mass_est_samples = []
 
-MASS_EST_MIN_SAMPLES = 20
+MASS_EST_MIN_SAMPLES = 30
 MASS_EST_MAX_SAMPLES = 100
 MASS_EST_DEN_THRESH = 2.0
 MASS_EST_EXTRA_DELAY = 1.5
 
-MEASURE_POS_TOL = 0.0075
+MEASURE_POS_TOL = 0.005
 COM_EST_MIN_SAMPLES = 20
 
 def create_socket():
@@ -185,8 +185,12 @@ counter = 0
 F_MIN_NORM = 5.0
 
 COM_AVG_WINDOW = 50
-com_tool_samples = []
+force_tool_samples = []
+torque_tool_samples = []
 com_offset_is_valid = False
+
+lateral_bias_base = np.zeros(2)
+lateral_bias_captured = False
 
 com_est = np.zeros(3)
 com_est_tool = np.zeros(3)
@@ -206,7 +210,7 @@ waypoints = np.array([
     [0.000, 0.680, -0.013],  # wp3 close
     [0.133, 0.492, 0.2446],  # wp4 measurement
     [-0.30, 0.300, 0.030],   # wp5 pre-place
-    [-0.30, 0.300, 0.020],   # wp6 place
+    [-0.30, 0.300, 0.021],   # wp6 place
     [0.000, 0.400, 0.300],   # wp7 retreat
 ])
 
@@ -218,10 +222,13 @@ velocity = np.zeros(6)
 desired_accel_m1 = np.zeros(3)
 desired_velocity_3d = np.zeros(3)
 
+# Disturbance-free reference model kept for checking only.
 ideal_position_3d = None
 ideal_velocity_3d = np.zeros(3)
 ideal_accel_3d = np.zeros(3)
 
+# Position obtained by integrating the final commanded velocity sent to RTDE.
+# This is logged both as cmd_traj_* and ideal_traj_* for compatibility with the current plot file.
 cmd_position_3d = None
 cmd_velocity_3d = np.zeros(3)
 
@@ -299,7 +306,7 @@ while keep_running:
     # Virtual admittance parameters
     m = 4.0
     k = 300.0
-    b = 4.0 * 2.0 * np.sqrt(m * k)
+    b = 1 * 2.0 * np.sqrt(m * k)
 
     actual_position = np.array(tcp_pose[:3])
     waypoint_nom = waypoint.copy()
@@ -366,6 +373,15 @@ while keep_running:
     else:
         mass_estimation_used = 0.0
 
+    # Capturing the xy plane FT bias once at the post-grasp timesteps, then removing it
+    if gripping_now and payload_mass_is_valid and (not lateral_bias_captured):
+        lateral_bias_base = compensated_force_filtered[:2].copy()
+        lateral_bias_captured = True
+
+    if gripping_now and lateral_bias_captured:
+        external_force_3d[:2] -= lateral_bias_base
+
+    # Stage 2: use F_exc to compensate payload effect in z
     if gripping_now and APPLY_TRANSPORT_COMP and payload_mass_is_valid:
         if TRANSPORT_COMP_MODE == "Z":
             if not z_comp_blocked:
@@ -392,6 +408,7 @@ while keep_running:
         ideal_velocity_3d[:] = 0.0
         ideal_accel_3d[:] = 0.0
 
+    # Stage 3: estimate CoM from FT by stacked lsquaer
     force_comp_tool = rodrigues_rotate(compensated_force_filtered, rotation_axis, -theta)
     torque_comp_tool = rodrigues_rotate(compensated_torque_filtered, rotation_axis, -theta)
 
@@ -403,21 +420,22 @@ while keep_running:
     )
 
     if com_est_window_active and (abs(force_comp_tool[2]) > F_MIN_NORM):
-        com_est_tool = np.array([
-            -torque_comp_tool[1] / force_comp_tool[2],
-             torque_comp_tool[0] / force_comp_tool[2],
-             0.0
-        ])
-        com_est = rodrigues_rotate(com_est_tool, rotation_axis, theta)
+        force_tool_samples.append(force_comp_tool.copy())
+        torque_tool_samples.append(torque_comp_tool.copy())
+        if len(force_tool_samples) > COM_AVG_WINDOW:
+            force_tool_samples.pop(0)
+            torque_tool_samples.pop(0)
 
-        com_tool_samples.append(com_est_tool.copy())
-        if len(com_tool_samples) > COM_AVG_WINDOW:
-            com_tool_samples.pop(0)
-
-        if len(com_tool_samples) >= COM_EST_MIN_SAMPLES:
-            com_est_tool_avg = np.mean(np.vstack(com_tool_samples), axis=0)
+        if len(force_tool_samples) >= COM_EST_MIN_SAMPLES:
+            A_stack = np.vstack([-skew(f) for f in force_tool_samples])
+            b_stack = np.hstack(torque_tool_samples)
+            com_est_tool_avg = np.linalg.lstsq(A_stack, b_stack, rcond=None)[0]
             com_est_avg = rodrigues_rotate(com_est_tool_avg, rotation_axis, theta)
+            com_est_avg[2] = 0.0  # apply the correction in the lateral (x-y) plane only
             com_offset_is_valid = True
+
+        com_est_tool = com_est_tool_avg.copy()
+        com_est = rodrigues_rotate(com_est_tool, rotation_axis, theta)
     else:
         com_est_tool = np.zeros(3)
         com_est = np.zeros(3)
@@ -432,7 +450,7 @@ while keep_running:
     print(f"Mode={TRANSPORT_COMP_MODE}, comp_on={APPLY_TRANSPORT_COMP}, xy_corr={APPLY_XY_CORR}")
     print(f"wp={wp_num_ctrl}, gripping={gripping_now}, at_measure_wp={at_measure_wp}, measure_done={measurement_done}")
     print(f"Mass raw/used/locked/valid [kg]: {mass_estimation_raw:.3f}, {mass_estimation_used:.3f}, {payload_mass_locked:.3f}, {int(payload_mass_is_valid)}")
-    print(f"Mass samples: {len(mass_est_samples)} | CoM samples: {len(com_tool_samples)}")
+    print(f"Mass samples: {len(mass_est_samples)} | CoM samples: {len(force_tool_samples)}")
     print(f"payload_force_hat_3d [N]: {payload_force_hat_3d}")
     print(f"residual_force_3d [N]: {residual_force_3d}")
     print(f"tcp xyz [mm]: {1000.0 * actual_position}")
@@ -475,12 +493,16 @@ while keep_running:
             payload_mass_is_valid = False
             mass_est_samples = []
 
-            com_tool_samples = []
+            force_tool_samples = []
+            torque_tool_samples = []
             com_offset_is_valid = False
             com_est_tool_avg = np.zeros(3)
             com_est_avg = np.zeros(3)
             com_est_tool = np.zeros(3)
             com_est = np.zeros(3)
+
+            lateral_bias_base = np.zeros(2)
+            lateral_bias_captured = False
 
         elif wp_num == 6:
             grasp = 0
@@ -493,12 +515,16 @@ while keep_running:
             payload_mass_is_valid = False
             mass_est_samples = []
 
-            com_tool_samples = []
+            force_tool_samples = []
+            torque_tool_samples = []
             com_offset_is_valid = False
             com_est_tool_avg = np.zeros(3)
             com_est_avg = np.zeros(3)
             com_est_tool = np.zeros(3)
             com_est = np.zeros(3)
+
+            lateral_bias_base = np.zeros(2)
+            lateral_bias_captured = False
 
     if now_time <= grasp_delay:
         desired_velocity_3d = np.zeros(3)
@@ -507,7 +533,8 @@ while keep_running:
     velocity[:3] = desired_velocity_3d
     velocity[3:6] = 0.0
 
-
+    # Integrate the final commanded velocity to sent to RTDE.
+    # This gives the commanded TCP trajectory used for plotting.
     if cmd_position_3d is None:
         cmd_position_3d = actual_position.copy()
 
@@ -546,7 +573,7 @@ while keep_running:
         "mass_est_window_active": int(mass_est_window_active),
         "com_est_window_active": int(com_est_window_active),
         "mass_sample_count": int(len(mass_est_samples)),
-        "com_sample_count": int(len(com_tool_samples)),
+        "com_sample_count": int(len(force_tool_samples)),
         "pre_place_stage": int(wp_num_ctrl == pre_place_wp_idx),
         "place_stage": int(wp_num_ctrl == place_wp_idx),
         "release_stage": int(wp_num_ctrl == release_wp_idx),
@@ -564,16 +591,17 @@ while keep_running:
     add_vec3(row, "desired_vel", desired_velocity_3d)
     add_vec3(row, "desired_acc", desired_accel)
 
-
+    # Keep ideal_traj_* for compatibility with the existing plot file.
+    # Here ideal_traj_* means the integrated commanded trajectory.
     add_vec3(row, "ideal_traj", cmd_position_3d)
     add_vec3(row, "ideal_vel", cmd_velocity_3d)
     add_vec3(row, "ideal_acc", desired_accel)
 
-
+    # Also save explicit names to avoid ambiguity in future plots.
     add_vec3(row, "cmd_traj", cmd_position_3d)
     add_vec3(row, "cmd_vel", cmd_velocity_3d)
 
-
+    # Save the disturbance-free admittance reference separately for checking.
     add_vec3(row, "ref_traj", ideal_position_3d)
     add_vec3(row, "ref_vel", ideal_velocity_3d)
     add_vec3(row, "ref_acc", ideal_accel_3d)
